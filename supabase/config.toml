@@ -1,0 +1,2 @@
+[functions.send-safety-notifications]
+verify_jwt = false
