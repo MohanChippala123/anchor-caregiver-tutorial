@@ -23,7 +23,6 @@ import CareNotesScreen from '../screens/CareNotesScreen';
 import MoodCheckinScreen from '../screens/MoodCheckinScreen';
 import VitalsScreen from '../screens/VitalsScreen';
 import WeeklyReportScreen from '../screens/WeeklyReportScreen';
-import FamilyScreen from '../screens/FamilyScreen';
 import { supabase } from '../lib/supabase';
 
 const Stack = createNativeStackNavigator();
@@ -115,7 +114,6 @@ export default function RootNavigator() {
             <Stack.Screen name="MoodCheckin" component={MoodCheckinScreen} />
             <Stack.Screen name="Vitals" component={VitalsScreen} />
             <Stack.Screen name="WeeklyReport" component={WeeklyReportScreen} />
-            <Stack.Screen name="Family" component={FamilyScreen} />
           </Stack.Navigator>
         </NavigationContainer>
       </SafeAreaView>

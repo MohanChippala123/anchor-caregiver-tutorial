@@ -1,34 +1,50 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { LESSONS, TUTORIAL_VERSION, needsCaregiverTutorial, tutorialProgress } = require('../lib/caregiverTutorial');
+const { createTourClient } = require('../lib/tourClient');
+const { STEPS, TUTORIAL_VERSION, needsCaregiverTutorial } = require('../lib/caregiverTutorial');
 const { initialDestination } = require('../lib/startup');
-
-const newCaregiver = { id: 'new-caregiver', user_metadata: { caregiver_tutorial_version: TUTORIAL_VERSION, caregiver_tutorial_completed: false } };
-
-test('only newly enrolled, unfinished caregiver accounts require the tutorial', () => {
-  assert.equal(needsCaregiverTutorial(newCaregiver), true);
-  assert.equal(needsCaregiverTutorial({ ...newCaregiver, user_metadata: { caregiver_tutorial_version: TUTORIAL_VERSION } }), true);
-  assert.equal(needsCaregiverTutorial({ ...newCaregiver, user_metadata: { ...newCaregiver.user_metadata, caregiver_tutorial_completed: true } }), false);
-  assert.equal(needsCaregiverTutorial({ id: 'existing', user_metadata: {} }), false);
-  assert.equal(needsCaregiverTutorial({ ...newCaregiver, is_anonymous: true }), false);
-  assert.equal(needsCaregiverTutorial(null), false);
+test('practice edits are isolated and survive a saved-workspace reload', async () => {
+  const writes = [];
+  const practice = createTourClient(null, event => writes.push(event));
+  const { data: patient } = await practice.from('patients').insert({ name: 'Alex', created_by: 'tour-caregiver' }).select().single();
+  const { data: medicine } = await practice.from('medications').insert({ patient_id: patient.id, name: 'Example', pills_remaining: 20 }).select().single();
+  await practice.from('medications').update({ pills_remaining: 12 }).eq('id', medicine.id);
+  const snapshot = practice.snapshot();
+  const resumed = createTourClient(snapshot);
+  snapshot.medications[0].pills_remaining = 999;
+  assert.equal((await resumed.from('medications').select().eq('id', medicine.id).single()).data.pills_remaining, 12);
+  const reading = (await resumed.from('vital_signs').select().eq('patient_id', patient.id)).data[0];
+  assert.equal(reading.value, '98');
+  await resumed.from('medications').delete().eq('id', medicine.id);
+  assert.equal((await resumed.from('medications').select()).data.length, 0);
+  assert.equal((await practice.from('medications').select()).data.length, 1);
+  assert.equal(writes.length, 3);
+  assert.equal(practice.auth.updateUser, undefined);
 });
-
-test('tutorial enrollment survives confirmed-email login and normal startup', async () => {
+test('practice queries scope writes and execute a request once', async () => {
+  const practice = createTourClient();
+  await practice.from('tasks').insert([{ id: 'a', title: 'A', active: true }, { id: 'b', title: 'B', active: true }]);
+  await practice.from('tasks').update({ title: 'Changed' }).eq('id', 'b');
+  assert.equal((await practice.from('tasks').select().eq('id', 'a').single()).data.title, 'A');
+  const request = practice.from('tasks').insert({ title: 'Once' });
+  await request; await request;
+  assert.equal((await practice.from('tasks').select()).data.length, 3);
+  await practice.from('caregiver_phone').upsert({ user_id: 'tour-caregiver', phone: '123' });
+  await practice.from('caregiver_phone').upsert({ user_id: 'tour-caregiver', phone: '456' });
+  assert.equal((await practice.from('caregiver_phone').select()).data.length, 1);
+});
+test('new caregivers are enrolled without forcing existing or patient accounts', async () => {
+  const user = { id: 'new', user_metadata: { caregiver_tutorial_version: TUTORIAL_VERSION, caregiver_tutorial_completed: false } };
+  assert.equal(needsCaregiverTutorial(user), true);
+  assert.equal(needsCaregiverTutorial({ ...user, is_anonymous: true }), false);
+  assert.equal(needsCaregiverTutorial({ id: 'existing' }), false);
+  assert.equal(needsCaregiverTutorial({ ...user, user_metadata: { caregiver_tutorial_version: 2, caregiver_tutorial_completed: false } }), false);
+  assert.equal(needsCaregiverTutorial({ ...user, user_metadata: { ...user.user_metadata, caregiver_tutorial_completed: true } }), false);
   const client = { from: () => ({ select() { return this; }, eq() { return this; }, async maybeSingle() { return { data: { role: 'caregiver' } }; } }) };
-  assert.deepEqual(await initialDestination(client, { user: newCaregiver }), { route: 'CaregiverTutorial', patientId: null });
-  assert.deepEqual(await initialDestination(client, { user: { ...newCaregiver, user_metadata: { ...newCaregiver.user_metadata, caregiver_tutorial_completed: true } } }), { route: 'CaregiverHome', patientId: null });
-  assert.deepEqual(await initialDestination(client, { user: { id: 'existing' } }), { route: 'CaregiverHome', patientId: null });
+  assert.equal((await initialDestination(client, { user })).route, 'CaregiverTutorial');
 });
-
-test('saved tutorial progress rejects corrupt and out-of-range values', () => {
-  assert.equal(tutorialProgress('5'), 5);
-  for (const value of ['oops', '-1', '1.5', String(LESSONS.length), undefined]) assert.equal(tutorialProgress(value), 0);
-});
-
-test('the guide covers care-plan tabs, pairing, safety and family with valid knowledge checks', () => {
-  const ids = new Set(LESSONS.map(lesson => lesson.id));
-  assert.equal(ids.size, LESSONS.length);
-  for (const id of ['settings', 'patient', 'pairing', 'medications', 'tasks', 'schedule', 'notes', 'records', 'safety', 'family', 'ready']) assert.ok(ids.has(id));
-  for (const lesson of LESSONS.filter(item => item.question)) assert.ok(Number.isInteger(lesson.answer) && lesson.choices[lesson.answer]);
+test('the walkthrough uses real app actions instead of quizzes', () => {
+  assert.ok(STEPS.some(step => step.write === 'patients'));
+  for (const table of ['medications', 'tasks', 'daily_plans', 'care_notes', 'appointments']) assert.ok(STEPS.some(step => step.write === table));
+  assert.ok(STEPS.every(step => !step.question && !step.choices));
 });

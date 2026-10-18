@@ -1,147 +1,131 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { View, Text, ScrollView, TouchableOpacity, TextInput, KeyboardAvoidingView, Platform, ActivityIndicator } from 'react-native';
+import { View, Text, ScrollView, ActivityIndicator } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { usePreventRemove } from '@react-navigation/native';
-import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
 import { signOutWithCleanup } from '../lib/session';
+import { CaregiverTourContext } from '../components/CaregiverTour';
+import { CareAction, CareError } from '../components/CarePlanUI';
 import Button from '../components/Button';
-import WeekdaySelector from '../components/WeekdaySelector';
-import { CareCard, CareBody, CareInset, CareAction, CareError } from '../components/CarePlanUI';
-import { NAVY, WHITE, SURFACE, BORDER, MUTED, SUCCESS_BG } from '../theme/colors';
-const { LESSONS, TUTORIAL_VERSION, needsCaregiverTutorial, tutorialProgress } = require('../lib/caregiverTutorial');
+import CaregiverHomeScreen from './CaregiverHomeScreen';
+import ProfileScreen from './ProfileScreen';
+import PatientDetailScreen from './PatientDetailScreen';
+import AppointmentsScreen from './AppointmentsScreen';
+import { NAVY, WHITE, SURFACE, BORDER, MUTED } from '../theme/colors';
+const { STEPS, TUTORIAL_VERSION, needsCaregiverTutorial } = require('../lib/caregiverTutorial');
+const { createTourClient } = require('../lib/tourClient');
 const { withTimeout } = require('../lib/startup');
+const SCREENS = { CaregiverHome: CaregiverHomeScreen, Profile: ProfileScreen, PatientDetail: PatientDetailScreen, Appointments: AppointmentsScreen };
 
-const inputStyle = { borderWidth: 1, borderColor: BORDER, borderRadius: 8, padding: 14, fontFamily: 'DMSans_400Regular', fontSize: 16, color: NAVY, marginBottom: 12 };
-
-export default function CaregiverTutorialScreen({ navigation, route }) {
-  const [step, setStep] = useState(0);
-  const [userId, setUserId] = useState(null);
-  const [review, setReview] = useState(false);
-  const [ready, setReady] = useState(false);
-  const [busy, setBusy] = useState(false);
+export default function CaregiverTutorialScreen({ navigation }) {
+  const [index, setIndex] = useState(0);
+  const [view, setView] = useState('CaregiverHome');
+  const [client, setClient] = useState(null);
+  const [completed, setCompleted] = useState([]);
   const [error, setError] = useState('');
-  const [answer, setAnswer] = useState(null);
-  const [practice, setPractice] = useState(false);
-  const [sampleName, setSampleName] = useState('');
-  const [sampleDays, setSampleDays] = useState([]);
-  const [sampleInstructions, setSampleInstructions] = useState('Take with food');
-  const [demoEditor, setDemoEditor] = useState(false);
-  const [showLessons, setShowLessons] = useState(false);
-  const scroll = useRef(null);
-  const finished = useRef(false);
-  const mounted = useRef(true);
-  const lesson = LESSONS[step];
-  const progressKey = `anchor.caregiver-tutorial.${TUTORIAL_VERSION}.${userId}`;
-  const finalStep = step === LESSONS.length - 1;
-
+  const [busy, setBusy] = useState(false);
+  const userId = useRef(null), current = useRef(0), finished = useRef(false), alive = useRef(true), queue = useRef(Promise.resolve());
+  const step = STEPS[index];
+  const canContinue = !!step.next && (!step.write || completed.includes(step.id));
+  const storageKey = id => `anchor.caregiver-walkthrough.${TUTORIAL_VERSION}.${id}`;
+  const persist = (position, dataClient, done) => {
+    if (!userId.current) return;
+    const value = JSON.stringify({ index: position, stepId: STEPS[position].id, tables: dataClient.snapshot(), completed: done });
+    queue.current = queue.current.catch(() => {}).then(() => AsyncStorage.setItem(storageKey(userId.current), value));
+    queue.current.catch(() => { if (alive.current) setError('Could not save your place. Keep this walkthrough open, or try again before leaving.'); });
+  };
   const load = async () => {
     setError('');
-    setReady(false);
     try {
-      const { data: { user }, error: userError } = await withTimeout(() => supabase.auth.getUser());
-      if (userError || !user || user.is_anonymous) throw new Error('Please sign in with your caregiver account to open this guide.');
-      const replay = !!route?.params?.review && !needsCaregiverTutorial(user);
-      const saved = replay ? null : await AsyncStorage.getItem(`anchor.caregiver-tutorial.${TUTORIAL_VERSION}.${user.id}`);
-      if (!mounted.current) return;
-      setUserId(user.id);
-      setReview(replay);
-      setStep(replay ? 0 : tutorialProgress(saved));
-      setReady(true);
-    } catch (err) { if (mounted.current) setError(err.message || 'Could not open the guide. Please try again.'); }
+      const { data: { user }, error: authError } = await withTimeout(() => supabase.auth.getUser());
+      if (authError || !user || user.is_anonymous) throw new Error('Please sign in with your caregiver account.');
+      if (!needsCaregiverTutorial(user)) {
+        finished.current = true;
+        navigation.reset({ index: 0, routes: [{ name: 'CaregiverHome' }] });
+        return;
+      }
+      let saved = null;
+      const raw = await AsyncStorage.getItem(storageKey(user.id));
+      try { saved = raw ? JSON.parse(raw) : null; } catch {}
+      if (!saved?.tables || typeof saved.tables !== 'object' || Array.isArray(saved.tables) || !Object.values(saved.tables).every(Array.isArray)) saved = null;
+      const namedPosition = STEPS.findIndex(item => item.id === saved?.stepId);
+      const position = namedPosition >= 0 ? namedPosition : Number.isInteger(saved?.index) && saved.index >= 0 ? Math.min(saved.index, STEPS.length - 1) : 0;
+      const done = Array.isArray(saved?.completed) ? saved.completed.filter(id => STEPS.some(item => item.id === id)) : [];
+      if (!alive.current) return;
+      userId.current = user.id; current.current = position;
+      setIndex(position); setView(STEPS[position].screen); setCompleted(done);
+      const practice = createTourClient(saved?.tables, change => {
+        const activeStep = STEPS[current.current];
+        setCompleted(previous => {
+          const next = activeStep.write === change.table && (!activeStep.mode || activeStep.mode === change.mode) && !previous.includes(activeStep.id) ? [...previous, activeStep.id] : previous;
+          persist(current.current, practice, next);
+          return next;
+        });
+      });
+      setClient(practice);
+    } catch (err) { if (alive.current) setError(err.message || 'Could not open the walkthrough.'); }
   };
-
-  useEffect(() => { mounted.current = true; load(); return () => { mounted.current = false; }; }, []);
-  usePreventRemove(!review, ({ data }) => {
+  useEffect(() => { alive.current = true; load(); return () => { alive.current = false; }; }, []);
+  usePreventRemove(true, ({ data }) => {
     if (finished.current) navigation.dispatch(data.action);
-    else setError('Complete the guide to start using Anchor. You can sign out or return later without losing your place.');
+    else setError('Finish the walkthrough to get started, or use Sign out to pause. Your practice progress is saved.');
   });
-  useEffect(() => {
-    setAnswer(null); setPractice(false); setSampleName(''); setSampleDays([]);
-    setSampleInstructions('Take with food'); setDemoEditor(false);
-    scroll.current?.scrollTo({ y: 0, animated: false });
-  }, [step]);
-
-  const move = async next => {
-    if (busy) return;
-    setBusy(true); setError('');
-    try {
-      if (!review) await AsyncStorage.setItem(progressKey, String(next));
-      setStep(next);
-    } catch { setError('Could not save your place. Please try again.'); }
-    finally { setBusy(false); }
+  const move = next => {
+    current.current = next; setIndex(next); setView(STEPS[next].screen); setError('');
+    persist(next, client, completed);
   };
-
   const finish = async () => {
     if (busy) return;
     setBusy(true); setError('');
     try {
-      if (!review) {
         const { data: { user }, error: userError } = await withTimeout(() => supabase.auth.getUser());
-        if (userError || user?.id !== userId) throw new Error('Your session changed. Sign in again to finish the guide.');
-        const { error: saveError } = await withTimeout(() => supabase.auth.updateUser({ data: { caregiver_tutorial_completed: true } }));
-        if (saveError) throw saveError;
-        finished.current = true;
-        await AsyncStorage.removeItem(progressKey).catch(() => {});
-      }
-      if (review && navigation.canGoBack()) navigation.goBack();
-      else navigation.reset({ index: 0, routes: [{ name: 'CaregiverHome' }] });
-    } catch (err) { setError(err.message || 'Could not finish the guide. Your progress is saved; please try again.'); }
+      if (userError || user?.id !== userId.current) throw new Error('Your session changed. Sign in again to finish.');
+      const { error: saveError } = await withTimeout(() => supabase.auth.updateUser({ data: { caregiver_tutorial_completed: true } }));
+      if (saveError) throw saveError;
+      await queue.current.catch(() => {});
+      await AsyncStorage.removeItem(storageKey(userId.current)).catch(() => {});
+      finished.current = true;
+      navigation.reset({ index: 0, routes: [{ name: 'CaregiverHome' }] });
+    } catch (err) { setError(err.message || 'Could not save completion. Please try again.'); }
     finally { setBusy(false); }
   };
-
-  const signOut = async () => {
+  const leave = async () => {
     if (busy) return;
-    setBusy(true); setError('');
-    try {
-      await signOutWithCleanup(); finished.current = true;
-      navigation.reset({ index: 0, routes: [{ name: 'Landing' }] });
-    } catch (err) { setError(err.message || 'Could not sign out. Please try again.'); }
+    setBusy(true);
+    try { await queue.current.catch(() => {}); await signOutWithCleanup(); finished.current = true; navigation.reset({ index: 0, routes: [{ name: 'Landing' }] }); }
+    catch (err) { setError(err.message || 'Could not sign out.'); }
     finally { setBusy(false); }
   };
-
-  let canContinue = true;
-  if (lesson.question) canContinue = answer === lesson.answer;
-  if (lesson.practice === 'patient') canContinue = sampleName.trim().length > 0;
-  if (lesson.practice === 'days') canContinue = sampleDays.length > 0;
-  if (['medication', 'activity', 'pin'].includes(lesson.practice) || finalStep) canContinue = practice;
-
-  return <KeyboardAvoidingView style={{ flex: 1, backgroundColor: WHITE }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-    <View style={{ paddingHorizontal: 22, paddingTop: 12, width: '100%', maxWidth: 720, alignSelf: 'center' }}>
-      <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
-        <Text accessibilityRole="header" style={{ flex: 1, fontFamily: 'DMSans_700Bold', fontSize: 22, color: NAVY }}>Caregiver tutorial</Text>
-        <CareAction label={review ? 'Close' : 'Sign out'} onPress={review ? () => navigation.goBack() : signOut} disabled={busy} />
-      </View>
-      {ready && <><Text style={{ color: MUTED, fontFamily: 'DMSans_500Medium', fontSize: 13, marginBottom: 8 }}>Lesson {step + 1} of {LESSONS.length}{review ? ' · Review' : ' · Your place is saved'}</Text>
-        <View accessibilityRole="progressbar" accessibilityLabel="Tutorial progress" accessibilityValue={{ min: 0, max: LESSONS.length, now: step + 1 }} style={{ height: 6, backgroundColor: SURFACE, borderRadius: 3 }}><View style={{ height: 6, width: `${((step + 1) / LESSONS.length) * 100}%`, backgroundColor: NAVY, borderRadius: 3 }} /></View></>}
+  const next = () => { if (!canContinue || busy) return; if (index === STEPS.length - 1) finish(); else move(index + 1); };
+  const localNavigation = {
+    navigate(name) {
+      if (step.navigate === name) move(index + 1);
+      else if (SCREENS[name]) setView(name);
+    },
+    goBack() { setView(view === 'Profile' || view === 'PatientDetail' ? 'CaregiverHome' : 'PatientDetail'); },
+    canGoBack: () => view !== 'CaregiverHome',
+    setParams() {}, reset() {},
+  };
+  const patient = client?.snapshot().patients?.[0];
+  const Screen = SCREENS[view];
+  const params = { patientId: patient?.id, patientName: patient?.name || 'Sample person', canEdit: true, isPatient: false, initialTab: step.tab || 'Medications' };
+  const context = { active: true, client, step, canContinue, next, highlight: id => step.target === id ? { borderWidth: 2, borderColor: NAVY, borderStyle: 'dashed' } : undefined };
+  return <View style={{ flex: 1, backgroundColor: WHITE }}>
+    <View style={{ paddingHorizontal: 18, paddingVertical: 8, borderBottomWidth: 1, borderColor: BORDER, backgroundColor: SURFACE }}>
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 18 }}>Caregiver walkthrough</Text><CareAction label="Sign out" onPress={leave} disabled={busy} /></View>
       <CareError message={error} />
-    </View>
-    <ScrollView ref={scroll} keyboardShouldPersistTaps="handled" contentContainerStyle={{ padding: 22, width: '100%', maxWidth: 720, alignSelf: 'center' }}>
-      {!ready ? error ? <Button title="Retry opening guide" onPress={load} /> : <ActivityIndicator color={NAVY} /> : <>
-        {review && <><CareAction label={showLessons ? 'Hide lessons' : 'Choose a lesson'} onPress={() => setShowLessons(!showLessons)} />{showLessons && LESSONS.map((item, index) => <CareAction key={item.id} label={`${index + 1}. ${item.title}`} onPress={() => { setShowLessons(false); move(index); }} disabled={busy} />)}</>}
-        <View style={{ width: 52, height: 52, backgroundColor: SURFACE, borderRadius: 14, justifyContent: 'center', alignItems: 'center', marginBottom: 16 }}><Ionicons name={lesson.icon} size={28} color={NAVY} /></View>
-        <Text accessibilityRole="header" style={{ fontFamily: 'DMSans_700Bold', fontSize: 28, lineHeight: 35, color: NAVY, marginBottom: 12 }}>{lesson.title}</Text>
-        <Text style={{ fontFamily: 'DMSans_400Regular', fontSize: 16, lineHeight: 25, color: MUTED, marginBottom: 22 }}>{lesson.summary}</Text>
-        <CareCard>{lesson.steps.map((text, index) => <View key={text} style={{ flexDirection: 'row', gap: 12, marginBottom: index === lesson.steps.length - 1 ? 0 : 18 }}><Text style={{ fontFamily: 'DMSans_700Bold', color: NAVY, fontSize: 16 }}>{index + 1}.</Text><Text style={{ flex: 1, fontFamily: 'DMSans_400Regular', color: NAVY, fontSize: 15, lineHeight: 24 }}>{text}</Text></View>)}</CareCard>
-        <CareInset><Text style={{ color: NAVY, fontFamily: 'DMSans_500Medium', fontSize: 14, lineHeight: 22 }}>{lesson.tip}</Text></CareInset>
-        {!!lesson.practice && <View style={{ marginTop: 22 }}><CareCard>
-          <Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 18, marginBottom: 6 }}>Try it safely</Text>
-          <CareBody>Practice only. These examples do not change a real care plan.</CareBody>
-          {lesson.practice === 'patient' && <><Text style={{ color: NAVY, marginBottom: 8 }}>Give your sample person a name</Text><TextInput accessibilityLabel="Sample patient name" placeholder="e.g. Alex" value={sampleName} onChangeText={setSampleName} maxLength={60} style={inputStyle} /><CareInset><Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 17 }}>{sampleName.trim() || 'Your sample person'}</Text><Text style={{ color: MUTED }}>Example pairing code: 12345678</Text></CareInset></>}
-          {lesson.practice === 'medication' && <><View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold' }}>Example medicine</Text><CareAction label="⋯" accessibilityLabel="Edit example medication" onPress={() => setDemoEditor(true)} /></View>{demoEditor ? <><Text style={{ color: MUTED, marginBottom: 8 }}>Change the sample instructions, then save.</Text><TextInput accessibilityLabel="Sample medication instructions" value={sampleInstructions} onChangeText={value => { setSampleInstructions(value); setPractice(false); }} style={inputStyle} /><Button title="Save example" disabled={!sampleInstructions.trim() || sampleInstructions.trim() === 'Take with food'} onPress={() => { setPractice(true); setDemoEditor(false); }} /></> : <><CareBody>{sampleInstructions}</CareBody><Text style={{ color: MUTED }}>{practice ? 'Saved in this practice example.' : 'Tap ⋯ to practice editing.'}</Text></>}</>}
-          {lesson.practice === 'days' && <WeekdaySelector value={sampleDays} onChange={setSampleDays} itemLabel="sample task" />}
-          {lesson.practice === 'activity' && <>{!practice ? <Button title="Add sample activity" onPress={() => setPractice(true)} /> : <CareInset><Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 17 }}>Afternoon walk</Text><Text style={{ color: MUTED }}>2:00 PM · 20 minutes · Today only</Text></CareInset>}</>}
-          {lesson.practice === 'pin' && <><View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}><Text style={{ flex: 1, color: NAVY, fontFamily: 'DMSans_700Bold' }}>Remember your water bottle</Text><CareAction label={practice ? 'Unpin' : 'Pin'} onPress={() => setPractice(!practice)} /></View><Text style={{ color: MUTED }}>{practice ? 'Pinned: this sample note has priority.' : 'Pin the sample note to give it priority.'}</Text></>}
-          {canContinue && <Text accessibilityLiveRegion="polite" style={{ color: NAVY, backgroundColor: SUCCESS_BG, padding: 12, borderRadius: 8, marginTop: 14 }}>Practice complete. You can continue.</Text>}
-        </CareCard></View>}
-        {!!lesson.question && <View style={{ marginTop: 22 }}><CareCard><Text style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 18, lineHeight: 26, marginBottom: 12 }}>Quick check: {lesson.question}</Text>{lesson.choices.map((choice, index) => <TouchableOpacity key={choice} accessibilityRole="radio" accessibilityState={{ checked: answer === index }} onPress={() => setAnswer(index)} style={{ minHeight: 48, padding: 14, backgroundColor: answer === index ? NAVY : SURFACE, borderRadius: 8, marginBottom: 8 }}><Text style={{ color: answer === index ? WHITE : NAVY, fontFamily: 'DMSans_500Medium', fontSize: 15, lineHeight: 23 }}>{choice}</Text></TouchableOpacity>)}{answer !== null && <Text accessibilityLiveRegion="polite" style={{ color: NAVY, fontSize: 14, lineHeight: 23, marginTop: 8 }}>{answer === lesson.answer ? 'That’s right. ' : 'Try another answer. '}{lesson.explanation}</Text>}</CareCard></View>}
-        {finalStep && <TouchableOpacity onPress={() => setPractice(!practice)} accessibilityRole="checkbox" accessibilityLabel="I am ready to use Anchor" accessibilityState={{ checked: practice }} style={{ marginTop: 22, backgroundColor: SURFACE, padding: 18, borderRadius: 8, flexDirection: 'row', alignItems: 'center', gap: 12 }}><Ionicons name={practice ? 'checkbox' : 'square-outline'} size={26} color={NAVY} /><Text style={{ flex: 1, fontFamily: 'DMSans_500Medium', color: NAVY, fontSize: 16, lineHeight: 24 }}>I know how to connect a patient, manage a care plan, and find help in Anchor.</Text></TouchableOpacity>}
-        {!review && <Text style={{ color: MUTED, fontSize: 12, lineHeight: 19, marginTop: 22 }}>Need a break? Close Anchor and return later. The guide resumes at this lesson.</Text>}
+      {!client ? error ? <Button title="Retry walkthrough" onPress={load} /> : <ActivityIndicator color={NAVY} /> : <>
+        <Text style={{ color: MUTED, fontFamily: 'DMSans_500Medium', fontSize: 12, marginBottom: 4 }}>Practice workspace · {index + 1} of {STEPS.length}</Text>
+        <ScrollView style={{ maxHeight: 130 }}><Text accessibilityRole="header" style={{ color: NAVY, fontFamily: 'DMSans_700Bold', fontSize: 17, marginBottom: 4 }}>{step.title}</Text><Text accessibilityLiveRegion="polite" style={{ color: NAVY, fontFamily: 'DMSans_400Regular', fontSize: 14, lineHeight: 21 }}>{step.text}</Text></ScrollView>
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 }}>
+          {index > 0 && <CareAction label="Back" disabled={busy} onPress={() => move(index - 1)} />}
+          {!!step.next && (canContinue ? <Button title={step.next} onPress={next} disabled={busy} loading={busy} style={{ flex: 1, paddingVertical: 10 }} /> : <Text style={{ flex: 1, color: MUTED, fontFamily: 'DMSans_500Medium', fontSize: 13, lineHeight: 19 }}>Use the highlighted controls below to continue.</Text>)}
+          {view !== step.screen && !canContinue && <CareAction label="Return to step" onPress={() => setView(step.screen)} />}
+        </View>
       </>}
-    </ScrollView>
-    {ready && <View style={{ borderTopWidth: 1, borderColor: BORDER, backgroundColor: WHITE, padding: 18 }}><View style={{ width: '100%', maxWidth: 676, alignSelf: 'center', flexDirection: 'row', gap: 12, alignItems: 'center' }}>
-      {step > 0 && <CareAction label="Back" onPress={() => move(step - 1)} disabled={busy} />}
-      <Button title={finalStep ? review ? 'Finish review' : 'Start using Anchor' : 'Continue'} onPress={finalStep ? finish : () => move(step + 1)} disabled={busy || !canContinue} loading={busy} style={{ flex: 1, borderRadius: 8 }} />
-    </View></View>}
-  </KeyboardAvoidingView>;
+    </View>
+    {!!client && <CaregiverTourContext.Provider value={context}><View style={{ flex: 1 }}>
+      {(view === 'PatientDetail' || view === 'Appointments') && !patient ? <View style={{ padding: 20 }}><Text style={{ color: NAVY }}>Add your sample person first.</Text><Button title="Add sample person" onPress={() => move(3)} /></View> : <Screen key={`${index}-${view}`} navigation={localNavigation} route={{ params }} />}
+    </View></CaregiverTourContext.Provider>}
+  </View>;
 }
